@@ -921,10 +921,10 @@ class OCRT2D:
                 # encode xzya_8 into integer:
                 angle_membership_augmented = tf.tile(tf.to_int32(self.angle_membership / self.angle_step), [4])
                 xzya_8 = tf.concat([xzy_8, angle_membership_augmented[:, None]], 1)
-                encoder = tf.to_int64(tf.stack([1, recon_size[0], recon_size[0] * recon_size[1],
+                encoder = tf.to_int32(tf.stack([1, recon_size[0], recon_size[0] * recon_size[1],
                                                 recon_size[0] * recon_size[1] * recon_size[2]], 0))
-                # encode to unique int64 integer:
-                xzya_1d = tf.reduce_sum(tf.to_int64(xzya_8) * encoder[None], 1)
+                # encode to unique int32 integer:
+                xzya_1d = tf.reduce_sum(tf.to_int32(xzya_8) * encoder[None], 1)
 
                 # isolate unique coordinates per angle:
                 xzya_1d_sorted, xzya_1d_sorted_ids = tf.nn.top_k(xzya_1d, k=tf.shape(xzya_1d)[0])
