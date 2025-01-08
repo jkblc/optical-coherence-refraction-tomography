@@ -290,15 +290,14 @@ class OCRT2D:
         if self.use_gpu:
             self.sess = tf.InteractiveSession()
         else:
-            config = tf.ConfigProto(device_count={'GPU': 0},
-                                    intra_op_parallelism_threads=intra,
-                                    inter_op_parallelism_threads=inter)
-            self.sess = tf.InteractiveSession(config=config)
+            tf.config.experimental.set_visible_devices([], 'GPU')  # To disable GPU if needed
+
 
         self.create_tf_variables()
         self.create_losses()
         self.create_train_op()
-        self.saver = tf.train.Saver()  # NOTE: saver only saves variables defined up until this line is run!
+        # Create a checkpoint to save and restore variables
+        self.checkpoint = tf.train.Checkpoint(model=self)  # NOTE: saver only saves variables defined up until this line is run!
         self.modify_loss_and_train_op_and_initialize()
 
         self.graph_built = True
@@ -311,9 +310,10 @@ class OCRT2D:
         # use the build_graph function
 
         if self.batchsize is not None:
-            self.batchsize = tf.placeholder_with_default(self.batchsize, shape=None, name='batch_size')
-        else:  # by default, batch is same size as total number of angles
-            self.batchsize = tf.placeholder_with_default(len(self.ths), shape=None, name='batch_size')
+            self.batchsize = self.batchsize  # Simply assign the value directly
+        else:
+            # By default, batch is the same size as the total number of angles
+            self.batchsize = len(self.ths)
 
         with tf.name_scope('index_parameters'):
             if np.size(self.sig) == 1:
@@ -532,53 +532,65 @@ class OCRT2D:
         self.train_op = tf.group(*self.train_ops)
 
     def modify_loss_and_train_op_and_initialize(self):
-        # according to binary settings, modify the loss and/or train_op to do filter optimization; then, initialize all
-        # variables
+        # Modify loss and training operations based on settings, and initialize variables.
 
-        if self.infer_backprojection_filter:  # after registration, load ckpt and optimize the backprojection filter
+        if self.infer_backprojection_filter:  # After registration, load checkpoint and optimize the backprojection filter
             assert not self.use_spatial_shifts
-            # overwrite this:
+            # Overwrite this:
             x_interp, z_interp = self.interp_rays_2d(self.paths[:, :, :, 1], self.paths[:, :, :, 0])
-            self.stop_gradient_projection = False  # or else gradient can't flow
+            self.stop_gradient_projection = False  # Ensure gradients can flow
             loss_data = self.backprojection_tf(x_interp, z_interp)
-            # replace:
-            self.loss_terms = [tf.multiply(10., loss_data, name='data_loss')]
-            self.recon = tf.identity(self.recon, name='reconstruction')
-            self.error_map = tf.identity(self.error_map, name='error_map')
-            self.normalize = tf.identity(self.normalize, name='bp_normalizer')
-            self.forward = tf.identity(self.forward, name='forward_prediction')
-            # for now, slice the appropriate dim, because we are not doing 3D:
-            # (also, tf's total variation implemention is anisotropic)
+
+            # Replace loss terms
+            self.loss_terms = [10.0 * loss_data]
+            self.recon = self.recon  # No need for tf.identity in TensorFlow 2.x
+            self.error_map = self.error_map
+            self.normalize = self.normalize
+            self.forward = self.forward
+
+            # Compute total variation regularization
             TV_recon = self.TVreg_mask(self.recon[:, :, 5], use_sqrt=True, numgauss_s=self.recon_res[0])
-            TV_recon = tf.multiply(1e-7, TV_recon, name='TV_for_filter_opt')
+            TV_recon *= 1e-7
             self.loss_terms.append(TV_recon)
-            self.loss_term_names = tf.constant([term.name for term in self.loss_terms], name='list_of_loss_terms')
+            self.loss_term_names = [term.name for term in self.loss_terms]
 
-            self.train_op = tf.train.AdamOptimizer(learning_rate=.001).minimize(tf.reduce_sum(self.loss_terms),
-                                                                                var_list=[self.fbp_filters])
-            self.train_ops = [self.train_op]
+            # Define optimizer and trainable variables
+            optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+            trainable_vars = [self.fbp_filters]
 
-            self.sess.run(tf.global_variables_initializer())
-            self.saver.restore(self.sess, self.save_directory + '/model.ckpt')
+            # Training step function
+            @tf.function
+            def train_step():
+                with tf.GradientTape() as tape:
+                    loss = tf.reduce_sum(self.loss_terms)
+                gradients = tape.gradient(loss, trainable_vars)
+                optimizer.apply_gradients(zip(gradients, trainable_vars))
+
+            # Load checkpoint
+            checkpoint = tf.train.Checkpoint(model=self)
+            checkpoint.restore(self.save_directory + '/model.ckpt').expect_partial()
             self.second_round_of_optimization = True
 
-        else:  # optimize from scratch (without loading from a checkpoint)
-            self.sess.run(tf.global_variables_initializer())
+        else:  # Optimize from scratch (without loading from a checkpoint)
+            # Initialize variables directly (handled by eager execution in TF2)
             self.second_round_of_optimization = False
 
-    def save_graph(self):
-        # save model and model parameters
+        def save_graph(self):
+            # Save model and model parameters
 
-        if not os.path.exists(self.save_directory):
-            os.makedirs(self.save_directory)
-            print('Created new directory: ' + self.save_directory)
+            if not os.path.exists(self.save_directory):
+                os.makedirs(self.save_directory)
+                print('Created new directory: ' + self.save_directory)
 
-        if self.second_round_of_optimization:
-            # after filter optimization
-            self.saver.save(self.sess, self.save_directory + '/model_round2.ckpt')
-        else:
-            # after registration
-            self.saver.save(self.sess, self.save_directory + '/model.ckpt')
+            # Use tf.train.Checkpoint to save the model state
+            checkpoint = tf.train.Checkpoint(model=self)
+    
+            if self.second_round_of_optimization:
+                # Save checkpoint after filter optimization
+                save_path = checkpoint.save(file_prefix=self.save_directory + '/model_round2.ckpt')
+            else:
+                # Save checkpoint after registration
+                save_path = checkpoint.save(file_prefix=self.save_directory + '/model.ckpt')
 
     def get_parametric_indexdist(self, params, transition_thickness=.003):
         # parametric index distribution for a circular tube with logistic transitions (the transition thickness is given
@@ -1145,8 +1157,8 @@ class OCRT2D:
         Bscans = tf.transpose(Bscans, (0, 3, 1, 2))
         Bscans = tf.complex(Bscans, 0.)
         filters = tf.complex(self.fbp_filters, 0.)
-        fftd = tf_fftshift(tf.spectral.fft2d(Bscans)) * filters[None, None]
-        Bfilt = tf.real(tf.spectral.ifft2d(tf_ifftshift(fftd)))
+        fftd = tf_fftshift(tf.signal.fft2d(tf.cast(Bscans, tf.complex64))) * filters[None, None]
+        Bfilt = tf.math.real(tf.signal.ifft2d(tf_ifftshift(fftd)))
         Bfilt = tf.transpose(Bfilt, (0, 2, 3, 1))  # transpose back
         return Bfilt
 
