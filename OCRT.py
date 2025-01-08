@@ -127,6 +127,9 @@ class OCRT2D:
 
         self.graph_built = False  # has the graph been built yet?
 
+        self.batch_size = 16  # Default batch size; adjust as needed
+        self.num_batches = None  # Placeholder for number of batches
+
     def load_data_and_resolve_constants(self, data_directory):
         # 1. load data based on self.sample_id
         # 2. derive instance variables that depend on others (e.g., the ones defined in the constructor)
@@ -276,6 +279,18 @@ class OCRT2D:
         self.Xc = self.Xc.flatten()
         self.Zc = self.Zc.flatten()
 
+            # Slice Bscans into batches
+        num_samples = Bscans.shape[0]
+        self.num_batches = (num_samples + self.batch_size - 1) // self.batch_size
+        self.batched_Bscans = [Bscans[i:i + self.batch_size] for i in range(0, num_samples, self.batch_size)]
+
+        # Similarly, batch other inputs like x_init and z_init as needed
+        xzcoords = data['xzcoords']
+        self.batched_x_init = [xzcoords[i:i + self.batch_size, :, 0] for i in range(0, num_samples, self.batch_size)]
+        self.batched_z_init = [xzcoords[i:i + self.batch_size, :, 1] for i in range(0, num_samples, self.batch_size)]
+
+        print(f'Data loaded and split into {self.num_batches} batches.')
+
         print('data loaded: ' + str(time() - start) + ' sec')
 
     def build_graph(self, intra=0, inter=0):
@@ -305,14 +320,12 @@ class OCRT2D:
         print('graph built: ' + str(time() - start) + ' sec')
 
     def create_tf_variables(self):
-        # this function defines all variables, placeholders, and constants based on the current instance variable
-        # settings; be sure to set all desired hyperparameters beyond the constructor; i.e., run
-        # load_data_and_constants, and change any constants desired thereafter; no need to call this function directly,
-        # use the build_graph function
+        # This function defines all variables, placeholders, and constants based on the current instance variable settings.
+        # Ensure that settings such as batch size and input dimensions are handled properly.
 
         if self.batchsize is not None:
             self.batchsize = tf.placeholder_with_default(self.batchsize, shape=None, name='batch_size')
-        else:  # by default, batch is same size as total number of angles
+        else:  # By default, batch is the same size as the total number of angles
             self.batchsize = tf.placeholder_with_default(len(self.ths), shape=None, name='batch_size')
 
         with tf.name_scope('index_parameters'):
@@ -324,11 +337,11 @@ class OCRT2D:
                 raise Exception('sig must be a number or array matching the size of the index map')
             if np.size(self.A_nonparametric) == 1:
                 self.A_nonparametric = tf.Variable(self.A_nonparametric * np.ones(self.numgauss_s ** 2),
-                                                   dtype=np.float32,
-                                                   name='general_parameterization')
+                                                dtype=np.float32,
+                                                name='general_parameterization')
             elif np.size(self.A_nonparametric) == self.numgauss_s ** 2:
                 self.A_nonparametric = tf.Variable(self.A_nonparametric.flatten(), dtype=np.float32,
-                                                   name='general_parameterization')
+                                                name='general_parameterization')
             else:
                 raise Exception('A_nonparametric must be a number or an array matching the size of the index map')
             wall_thickness_mm = (self.tube_diameter - 736.5 * self.depth / self.Ascan_numpix) / 2
@@ -347,53 +360,51 @@ class OCRT2D:
             self.sigz = tf.Variable(self.sigz, dtype=tf.float32, name='sigz')
             self.h = tf.Variable(self.h, dtype=tf.float32, name='height_gaussian')
             self.PSF_general = np.zeros((self.sz, self.sx), dtype=np.float32)
-            self.PSF_general[self.sz // 2, self.sx // 2] = 1.  # start with delta func
+            self.PSF_general[self.sz // 2, self.sx // 2] = 1.  # Start with delta function
             self.PSF_general = tf.Variable(self.PSF_general, name='general')
 
         with tf.name_scope('reconstruction_related_parameters'):
             self.size_factor = tf.placeholder_with_default(self.size_factor_,
-                                                           shape=(),
-                                                           name='size_factor')
+                                                        shape=(),
+                                                        name='size_factor')
             self.recon_res = tf.to_int32(
                 tf.stack([self.numgauss_s * self.size_factor,
-                          self.numgauss_s * self.size_factor,
-                          512], name='recon_res'))
+                        self.numgauss_s * self.size_factor,
+                        512], name='recon_res'))
             self.recon_offset = tf.Variable(self.recon_offset, dtype=tf.float32, name='reconstruction_offset_bias')
             self.attenfact = tf.Variable(self.attenfact, dtype=tf.float32, name='exponential_attenuation_factor')
             self.attenexp = tf.Variable(self.attenexp, dtype=tf.float32, name='exponential_attenuation_exponent')
             self.angle_mod = tf.Variable(np.ones(self.discret_levels, dtype=np.float32),
-                                         name='angle_reflectance_profile')
+                                        name='angle_reflectance_profile')
             freqs = np.sqrt(np.abs(np.linspace(-1, 1, self.reduced_shape[1])))
             fbp_filters_ = np.tile(freqs[:, None], (1, self.reduced_shape[2]))
-            self.fbp_filters = tf.Variable(fbp_filters_, dtype=tf.float32, name='fbp_filters')
+            self.fbp_filters = tf.Variable(fbp_filters_, dtype=np.float32, name='fbp_filters')
 
-        # other constants (not optimized):
+        # Add placeholders for batched inputs
         with tf.name_scope('initial_ray_positions'):
-            # according to valid_Ascans, select only valid A-scans
-            self.x_init = np.rollaxis(np.dstack([self.x_init[i, self.valid_Ascans[i]] for
-                                                 i in range(self.batchsize.eval())]), 2, 0)
-            self.z_init = np.vstack([self.z_init[i, self.valid_Ascans[i]] for i in range(self.batchsize.eval())])
-            self.x_init = tf.placeholder_with_default(self.x_init, shape=None, name='x')
-            self.z_init = tf.placeholder_with_default(self.z_init, shape=None, name='z')
-        # rotation matrices
-        rotmats = list()
+            # Using dynamic shapes for batching
+            self.x_init = tf.placeholder(tf.float32, shape=[None, self.numz, self.numx], name='x')
+            self.z_init = tf.placeholder(tf.float32, shape=[None, self.numz], name='z')
+            self.Bscans_filtered = tf.placeholder(tf.float32, shape=[None, self.z_max, self.x_max],
+                                                name='for_interpolation_filtered')
+            self.Bscans_unfiltered = tf.placeholder(tf.float32, shape=[None, self.z_max, self.x_max],
+                                                    name='for_interpolation_unfiltered')
+
+        # Rotation matrices (batched)
+        rotmats = []
         for theta in self.ths:
             theta *= (np.pi / 180)
             theta = theta.astype(np.float32)
             rotmats.append(np.array([[np.cos(theta), -self.rotdir * np.sin(theta)],
-                                     [self.rotdir * np.sin(theta), np.cos(theta)]]))
+                                    [self.rotdir * np.sin(theta), np.cos(theta)]]))
         rotmats = np.rollaxis(np.dstack(rotmats), 2, 0).astype(np.float32)
         self.rotmats = tf.constant(rotmats, name='rotation_matrix')
 
-        self.Bscans_filtered = tf.placeholder(tf.float32, shape=self.Bscans_filtered_np.shape,
-                                              name='for_interpolation_filtered')
-        self.Bscans_unfiltered = tf.placeholder(tf.float32, shape=self.Bscans_unfiltered_np.shape,
-                                                name='for_interpolation_unfiltered')
-
+        # Regularization coefficient placeholders
         self.TV_reg_coeff = tf.placeholder_with_default(self.TV_reg_coeff_, shape=(),
                                                         name='index_spatial_regularization')
 
-        # define these (initial) learning rates as tensors so that they can be annealed
+        # Define learning rate placeholders
         self.lr_parametric = tf.placeholder_with_default(.001, shape=(), name='learning_rate_for_parametric_optim')
         if self.use_parametric_optimization:
             self.lr_nonparametric = tf.placeholder_with_default(.0, shape=(),
@@ -402,169 +413,158 @@ class OCRT2D:
             self.lr_nonparametric = tf.placeholder_with_default(.001, shape=(),
                                                                 name='learning_rate_for_nonparametric_optim')
 
-        # auxiliary tensors; for monitoring index distribution during training:
+        # Auxiliary tensors for monitoring index distribution
         xx = np.linspace(0, 1, self.imsize, dtype=np.float32)
         zz = np.linspace(0, 1, self.imsize, dtype=np.float32)
         [xc2, zc2] = np.meshgrid(xx, zz)
         xc2 = xc2.flatten()
         zc2 = zc2.flatten()
-        xc2 = np.tile(xc2, (self.batchsize.eval(), 1))
-        zc2 = np.tile(zc2, (self.batchsize.eval(), 1))
-        RI = self.indexdist(xc2, zc2)[0][0]  # the indexdist function was designed to be used by ray propagation code,
-        # so it contains extra stuff; here, we just want to see the index distribution
+
+        # Adjust for batches
+        xc2 = np.tile(xc2, (self.batchsize.eval() if self.batchsize is not None else len(self.ths), 1))
+        zc2 = np.tile(zc2, (self.batchsize.eval() if self.batchsize is not None else len(self.ths), 1))
+
+        RI = self.indexdist(xc2, zc2)[0][0]  # The indexdist function is designed for ray propagation
         self.RI = tf.reshape(RI * self.n_back, [self.imsize] * 2, name='index_image')
 
-    def create_losses(self):
-        # generate a list of losses, the sum of which is to be minimized
 
-        # get the paths:
-        with tf.name_scope('ray_propagation'):
-            self.paths, self.dpathdz = self.integrate_scan_opl(
-                self.x_init,
-                self.z_init,
-                return_derivs=True)
-            self.paths = tf.identity(self.paths, name='trajectories')
-            z_paths = self.paths[:, :, :, 0]  # for clarity
-            x_paths = self.paths[:, :, :, 1]
+        def create_train_op(self):
+            # generate list of train_ops (which should be grouped)
 
-        self.loss_terms = list()  # for nonparametric
+            loss = tf.reduce_sum(self.loss_terms)
+            with tf.name_scope('RI_train_op'):
+                train_op_nonparametric = tf.train.AdamOptimizer(learning_rate=self.lr_nonparametric).minimize(
+                    loss, var_list=[self.A_nonparametric])
 
-        # data-dependent loss:
-        with tf.name_scope('backprojection'):
-            self.x_interp, self.z_interp = self.interp_rays_2d(x_paths, z_paths)
-            loss_data = self.backprojection_tf(self.x_interp, self.z_interp)
-        self.loss_terms.append(tf.multiply(10., loss_data, name='data_loss'))
+                if self.use_parametric_optimization:
+                    train_op_parametric = tf.train.AdamOptimizer(learning_rate=self.lr_parametric).minimize(
+                        loss, var_list=[self.A_parametric])
+                    if self.switch_to_nonparametric:
+                        # in this case, have both present, and change the learning
+                        # rates during training
+                        train_op_ = tf.group(train_op_parametric, train_op_nonparametric)
+                    else:  # parametric optimization only
+                        train_op_ = train_op_parametric
+                else:  # nonparametric only
+                    train_op_ = train_op_nonparametric
 
-        # give stuff names for saving/restoring later:
-        with tf.name_scope('naming_OCRT_outputs'):
-            self.recon = tf.identity(self.recon, name='reconstruction')
-            self.error_map = tf.identity(self.error_map, name='error_map')
-            self.normalize = tf.identity(self.normalize, name='bp_normalizer')
-            self.forward = tf.identity(self.forward, name='forward_prediction')
+            self.train_ops = list()  # to be grouped together
+            self.train_ops.append(train_op_)
 
-        # regularization - spatial shift:
-        with tf.name_scope('regularization'):
-            if self.use_spatial_shifts:
-                shift_reg = tf.reduce_sum((self.xz_delta - self.xz_delta_init) ** 2)
-                shift_reg = tf.multiply(shift_reg, self.shift_reg_coeff, name='square_shift_reg')
-                self.loss_terms.append(shift_reg)
+            # train ops for other optimizable parameters other than index:
+            with tf.name_scope('non_RI_train_ops'):
+                if 'gaussian' in self.PSFconv_format:
+                    lr_PSF = .01
+                    train_op_PSF = tf.train.AdamOptimizer(learning_rate=lr_PSF).minimize(loss, var_list=[self.h])
+                    self.train_ops.append(train_op_PSF)
+                if 'arbitrary' in self.PSFconv_format:
+                    lr_PSF = .01
+                    train_op_PSF2 = tf.train.AdamOptimizer(learning_rate=lr_PSF).minimize(loss, var_list=[self.PSF_general])
+                    self.train_ops.append(train_op_PSF2)
 
-                # counteract changes in radius:
-                th_inds = np.arange(len(self.ths))
-                th_inds180 = np.roll(th_inds, len(self.ths) // 2)
+                if self.include_attenuation:
+                    lr_atten = .001
+                    train_op_atten1 = tf.train.AdamOptimizer(learning_rate=lr_atten).minimize(
+                        loss, var_list=[self.attenfact])
+                    train_op_atten2 = tf.train.AdamOptimizer(learning_rate=.05).minimize(loss, var_list=[self.attenexp])
+                    self.train_ops.append(train_op_atten1)
+                    self.train_ops.append(train_op_atten2)
 
-                xz_delta_x = self.xz_delta[:, 0]
-                xz_delta_z = self.xz_delta[:, 1]
-                diffx = xz_delta_x - tf.gather(xz_delta_x, th_inds180)
-                diffz = xz_delta_z - tf.gather(xz_delta_z, th_inds180)
-                tube_radius_change_reg = tf.reduce_sum(diffx ** 2 + diffz ** 2)
-                tube_radius_change_reg = tf.multiply(tube_radius_change_reg, self.tube_radius_change_reg_coeff,
-                                                     name='tube_expansion_reg')
-                self.loss_terms.append(tube_radius_change_reg)
+                if self.use_reflectance_model:
+                    train_op_refl = tf.train.AdamOptimizer(learning_rate=.01).minimize(loss, var_list=[self.angle_mod])
+                    self.train_ops.append(train_op_refl)
 
-            # regularization for nonparametric optimization:
-            support_reg = tf.multiply(4000., self.L2_mask(self.external_TV_mask.flatten()), name='support_reg')
-            TV_reg = tf.multiply(self.TV_reg_coeff, self.TVreg_mask(A=self.A_nonparametric, mask=self.internal_mask,
-                                                                    use_sqrt=True), name='TV_reg')
-        self.loss_terms.append(support_reg)
-        self.loss_terms.append(TV_reg)
+                train_op_reconoffset = tf.train.AdamOptimizer(learning_rate=.001).minimize(
+                    loss, var_list=[self.recon_offset])
+                self.train_ops.append(train_op_reconoffset)
 
-        # for convenience
-        self.loss_term_names = tf.constant([term.name for term in self.loss_terms], name='list_of_loss_terms')
+                if self.use_spatial_shifts:
+                    train_op_spatial_shifts = tf.train.AdamOptimizer(learning_rate=.0005).minimize(
+                        loss, var_list=[self.xz_delta])
+                    self.train_ops.append(train_op_spatial_shifts)
 
-    def create_train_op(self):
-        # generate list of train_ops (which should be grouped)
+            # have a separate instance variable for the grouped train_op:
+            # sometimes may want to modify the list of train_ops and then regroup
+            self.train_op = tf.group(*self.train_ops)
+            
+        def train_batches(self):
+            for batch_idx in range(self.num_batches):
+                # Fetch batched data
+                x_init_batch = self.batched_x_init[batch_idx]
+                z_init_batch = self.batched_z_init[batch_idx]
+                Bscans_batch = self.batched_Bscans[batch_idx]
 
-        loss = tf.reduce_sum(self.loss_terms)
-        with tf.name_scope('RI_train_op'):
-            train_op_nonparametric = tf.train.AdamOptimizer(learning_rate=self.lr_nonparametric).minimize(
-                loss, var_list=[self.A_nonparametric])
+                # Prepare feed dictionary
+                feed_dict = {
+                    self.Bscans_filtered: Bscans_batch,
+                    self.x_init: x_init_batch,
+                    self.z_init: z_init_batch,
+                    self.TV_reg_coeff: self.TV_reg_coeff_  # Add other placeholders as needed
+                }
 
-            if self.use_parametric_optimization:
-                train_op_parametric = tf.train.AdamOptimizer(learning_rate=self.lr_parametric).minimize(
-                    loss, var_list=[self.A_parametric])
-                if self.switch_to_nonparametric:
-                    # in this case, have both present, and change the learning
-                    # rates during training
-                    train_op_ = tf.group(train_op_parametric, train_op_nonparametric)
-                else:  # parametric optimization only
-                    train_op_ = train_op_parametric
-            else:  # nonparametric only
-                train_op_ = train_op_nonparametric
+                # Run the session for the current batch
+                loss, _ = self.sess.run([self.loss_terms, self.train_op], feed_dict=feed_dict)
+                print(f"Processed batch {batch_idx + 1}/{self.num_batches}, Loss: {loss}")
 
-        self.train_ops = list()  # to be grouped together
-        self.train_ops.append(train_op_)
+        def create_dataset(self, Bscans, x_init, z_init):
+            dataset = tf.data.Dataset.from_tensor_slices((Bscans, x_init, z_init))
+            dataset = dataset.batch(self.batch_size).prefetch(tf.data.AUTOTUNE)
+            iterator = tf.compat.v1.data.make_initializable_iterator(dataset)
+            next_batch = iterator.get_next()
+            return iterator, next_batch
 
-        # train ops for other optimizable parameters other than index:
-        with tf.name_scope('non_RI_train_ops'):
-            if 'gaussian' in self.PSFconv_format:
-                lr_PSF = .01
-                train_op_PSF = tf.train.AdamOptimizer(learning_rate=lr_PSF).minimize(loss, var_list=[self.h])
-                self.train_ops.append(train_op_PSF)
-            if 'arbitrary' in self.PSFconv_format:
-                lr_PSF = .01
-                train_op_PSF2 = tf.train.AdamOptimizer(learning_rate=lr_PSF).minimize(loss, var_list=[self.PSF_general])
-                self.train_ops.append(train_op_PSF2)
+        def train_with_dataset(self, iterator, next_batch):
+            self.sess.run(iterator.initializer)
+            while True:
+                try:
+                    Bscans_batch, x_init_batch, z_init_batch = self.sess.run(next_batch)
 
-            if self.include_attenuation:
-                lr_atten = .001
-                train_op_atten1 = tf.train.AdamOptimizer(learning_rate=lr_atten).minimize(
-                    loss, var_list=[self.attenfact])
-                train_op_atten2 = tf.train.AdamOptimizer(learning_rate=.05).minimize(loss, var_list=[self.attenexp])
-                self.train_ops.append(train_op_atten1)
-                self.train_ops.append(train_op_atten2)
+                    feed_dict = {
+                        self.Bscans_filtered: Bscans_batch,
+                        self.x_init: x_init_batch,
+                        self.z_init: z_init_batch
+                    }
 
-            if self.use_reflectance_model:
-                train_op_refl = tf.train.AdamOptimizer(learning_rate=.01).minimize(loss, var_list=[self.angle_mod])
-                self.train_ops.append(train_op_refl)
+                    loss, _ = self.sess.run([self.loss_terms, self.train_op], feed_dict=feed_dict)
+                    print(f"Batch Loss: {loss}")
+                except tf.errors.OutOfRangeError:
+                    print("All batches processed.")
+                    break
 
-            train_op_reconoffset = tf.train.AdamOptimizer(learning_rate=.001).minimize(
-                loss, var_list=[self.recon_offset])
-            self.train_ops.append(train_op_reconoffset)
+        def modify_loss_and_train_op_and_initialize(self):
+            # according to binary settings, modify the loss and/or train_op to do filter optimization; then, initialize all
+            # variables
 
-            if self.use_spatial_shifts:
-                train_op_spatial_shifts = tf.train.AdamOptimizer(learning_rate=.0005).minimize(
-                    loss, var_list=[self.xz_delta])
-                self.train_ops.append(train_op_spatial_shifts)
+            if self.infer_backprojection_filter:  # after registration, load ckpt and optimize the backprojection filter
+                assert not self.use_spatial_shifts
+                # overwrite this:
+                x_interp, z_interp = self.interp_rays_2d(self.paths[:, :, :, 1], self.paths[:, :, :, 0])
+                self.stop_gradient_projection = False  # or else gradient can't flow
+                loss_data = self.backprojection_tf(x_interp, z_interp)
+                # replace:
+                self.loss_terms = [tf.multiply(10., loss_data, name='data_loss')]
+                self.recon = tf.identity(self.recon, name='reconstruction')
+                self.error_map = tf.identity(self.error_map, name='error_map')
+                self.normalize = tf.identity(self.normalize, name='bp_normalizer')
+                self.forward = tf.identity(self.forward, name='forward_prediction')
+                # for now, slice the appropriate dim, because we are not doing 3D:
+                # (also, tf's total variation implemention is anisotropic)
+                TV_recon = self.TVreg_mask(self.recon[:, :, 5], use_sqrt=True, numgauss_s=self.recon_res[0])
+                TV_recon = tf.multiply(1e-7, TV_recon, name='TV_for_filter_opt')
+                self.loss_terms.append(TV_recon)
+                self.loss_term_names = tf.constant([term.name for term in self.loss_terms], name='list_of_loss_terms')
 
-        # have a separate instance variable for the grouped train_op:
-        # sometimes may want to modify the list of train_ops and then regroup
-        self.train_op = tf.group(*self.train_ops)
+                self.train_op = tf.train.AdamOptimizer(learning_rate=.001).minimize(tf.reduce_sum(self.loss_terms),
+                                                                                    var_list=[self.fbp_filters])
+                self.train_ops = [self.train_op]
 
-    def modify_loss_and_train_op_and_initialize(self):
-        # according to binary settings, modify the loss and/or train_op to do filter optimization; then, initialize all
-        # variables
+                self.sess.run(tf.global_variables_initializer())
+                self.saver.restore(self.sess, self.save_directory + '/model.ckpt')
+                self.second_round_of_optimization = True
 
-        if self.infer_backprojection_filter:  # after registration, load ckpt and optimize the backprojection filter
-            assert not self.use_spatial_shifts
-            # overwrite this:
-            x_interp, z_interp = self.interp_rays_2d(self.paths[:, :, :, 1], self.paths[:, :, :, 0])
-            self.stop_gradient_projection = False  # or else gradient can't flow
-            loss_data = self.backprojection_tf(x_interp, z_interp)
-            # replace:
-            self.loss_terms = [tf.multiply(10., loss_data, name='data_loss')]
-            self.recon = tf.identity(self.recon, name='reconstruction')
-            self.error_map = tf.identity(self.error_map, name='error_map')
-            self.normalize = tf.identity(self.normalize, name='bp_normalizer')
-            self.forward = tf.identity(self.forward, name='forward_prediction')
-            # for now, slice the appropriate dim, because we are not doing 3D:
-            # (also, tf's total variation implemention is anisotropic)
-            TV_recon = self.TVreg_mask(self.recon[:, :, 5], use_sqrt=True, numgauss_s=self.recon_res[0])
-            TV_recon = tf.multiply(1e-7, TV_recon, name='TV_for_filter_opt')
-            self.loss_terms.append(TV_recon)
-            self.loss_term_names = tf.constant([term.name for term in self.loss_terms], name='list_of_loss_terms')
-
-            self.train_op = tf.train.AdamOptimizer(learning_rate=.001).minimize(tf.reduce_sum(self.loss_terms),
-                                                                                var_list=[self.fbp_filters])
-            self.train_ops = [self.train_op]
-
-            self.sess.run(tf.global_variables_initializer())
-            self.saver.restore(self.sess, self.save_directory + '/model.ckpt')
-            self.second_round_of_optimization = True
-
-        else:  # optimize from scratch (without loading from a checkpoint)
-            self.sess.run(tf.global_variables_initializer())
-            self.second_round_of_optimization = False
+            else:  # optimize from scratch (without loading from a checkpoint)
+                self.sess.run(tf.global_variables_initializer())
+                self.second_round_of_optimization = False
 
     def save_graph(self):
         # save model and model parameters
@@ -703,21 +703,18 @@ class OCRT2D:
 
         return xzi
 
-    def integrate_scan_opl(self, x_init0, z_init0, return_derivs=False):
-        # this is the function that actually propagates the rays given initial conditions (first two arguments);
-        # return_derivs: whether this function returns derivatives of the paths;
+    def integrate_scan_opl(self, x_init_batch, z_init_batch, return_derivs=False):
+        # Concatenate x and z coordinates for the batch
+        xz_init0 = tf.concat([tf.expand_dims(z_init_batch, -1), x_init_batch], 2)
+        dummy = tf.ones([self.numz])  # Placeholder for tf.scan iterations
 
-        # pack into one tensor:
-        xz_init0 = tf.concat([tf.expand_dims(z_init0, -1), x_init0], 2)
-        # just needs to be a tensor whose leading dimension is of size numz:
-        dummy = tf.ones([self.numz])
+        # Propagate rays
         paths = tf.scan(self.rk4_step_opl, dummy, xz_init0, swap_memory=True)
 
-        if return_derivs:  # return everything (paths and derivatives)
+        if return_derivs:
             everything = tf.transpose(paths, [1, 0, 2, 3])
             return everything[:, :, :, 0:2], everything[:, :, :, 2]
         else:
-            # throw out the third one, which is the dx/dz:
             return tf.transpose(paths[:, :, :, 0:2], [1, 0, 2, 3])
 
     def interp_rays_2d(self, x_paths, z_paths):
